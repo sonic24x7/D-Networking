@@ -4,9 +4,9 @@
 # RMBC NUC225 CCTV Unit — Engineer LAN Port + WiFi 6 AP Setup
 #
 # Script 3 of 3 in deployment stack:
-#   1. installer-tailscale.sh        — apps & services
-#   2. prepare-cctv-storage-fixed.sh — NVMe storage
-#   3. configure-networking.sh       — this script
+#   A. prepare-cctv-storage-fixed.sh FIRST  — NVMe storage
+#   B. installer-tailscale.sh SECOND        — apps & services
+#   C. configure-networking.sh THIRD AND LAST — this script
 #
 # What this script does:
 #   - Installs required packages (hostapd, dnsmasq, rfkill, iw, network-manager)
@@ -624,6 +624,68 @@ verify() {
   fi
 }
 
+# ─── Timeshift Snapshot ───────────────────────────────────────────────────────
+# Taken after successful verification. Timeshift is already installed by earlier
+# scripts in the deployment stack — this function does NOT install or configure it.
+
+create_timeshift_snapshot() {
+  log "Creating Timeshift snapshot (post-networking-complete)..."
+
+  if ! timeshift --create --yes --scripted \
+       --comments "02-networking-complete-final-deployment" 2>&1 \
+       | tee -a "$LOG_FILE"; then
+    warn "Timeshift snapshot creation failed — continuing without snapshot."
+    return
+  fi
+
+  # Identify the newest snapshot directory
+  local snap_dir
+  snap_dir="$(find /timeshift/snapshots -mindepth 1 -maxdepth 1 -type d \
+    -printf '%T@ %p\n' 2>/dev/null \
+    | sort -n | tail -1 | awk '{print $2}')"
+
+  if [[ -z "${snap_dir:-}" ]]; then
+    warn "Could not locate newest Timeshift snapshot directory — skipping lock marker."
+    return
+  fi
+
+  log "Newest Timeshift snapshot directory: $snap_dir"
+
+  # Drop .rmbc_deploy_lock marker
+  if ! printf 'RMBC_DEPLOY_LOCK=GOLDEN_OPERATIONAL\nSCRIPT=configure-networking.sh\nHOSTNAME=%s\nDATE=%s\nSNAPSHOT=%s\n' \
+       "$(hostname)" "$(date -Iseconds)" "$snap_dir" \
+       > "${snap_dir}/.rmbc_deploy_lock" 2>/dev/null; then
+    warn "Failed to write .rmbc_deploy_lock to $snap_dir — continuing."
+    return
+  fi
+
+  # Drop README_RMBC_DEPLOY.txt
+  if ! cat > "${snap_dir}/README_RMBC_DEPLOY.txt" 2>/dev/null <<EOF
+RMBC NUC225 — Golden Operational Deployment Snapshot
+=====================================================
+This Timeshift snapshot was taken automatically by configure-networking.sh
+after successful completion of all three deployment scripts.
+
+Deployment stack completed:
+  A. prepare-cctv-storage-fixed.sh  — NVMe storage
+  B. installer-tailscale.sh         — apps & services
+  C. configure-networking.sh        — networking (this script)
+
+Unit     : $(hostname)
+Date     : $(date -Iseconds)
+Snapshot : $snap_dir
+
+This snapshot represents a known-good GOLDEN_OPERATIONAL state.
+Do not delete without engineering authorisation.
+EOF
+  then
+    warn "Failed to write README_RMBC_DEPLOY.txt to $snap_dir — continuing."
+    return
+  fi
+
+  log "Deployment lock markers written to: $snap_dir"
+}
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 main() {
@@ -662,6 +724,7 @@ main() {
   configure_routing          "$prod"
   restart_services "$wifi"
   verify "$eng" "$wifi" "$ssid"
+  create_timeshift_snapshot
 
   log "configure-networking.sh completed successfully."
 }
